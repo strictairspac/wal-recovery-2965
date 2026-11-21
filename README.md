@@ -2,9 +2,16 @@
 海砾计量数据保障组（8人）用可重放日志替代恢复演练时手工拼接的SQL片段和账本截图。
 
 ## 场景与模块
-上游为事务日志样例，下游为值班复核人。原流程人工标记提交、表格算恢复余额、截图写结论；痛点是崩溃点不清、撤销顺序容易错、恢复证据缺失。模块为事务日志集 / 故障注入点 / 恢复队列 / 恢复证据，实体LogSet/CrashCase/Recovery贯穿全栈。
+上游为事务日志样例，下游为值班复核人。原流程人工标记提交、表格算恢复余额、截图写结论；痛点是崩溃点不清、撤销顺序容易错、恢复证据缺失。模块为事务日志集 / 故障注入点 / 恢复队列 / 恢复证据，实体LogSet/CrashCase/Recovery贯穿全栈；另增双路并发复演，实体Replay/ReplayShard把同一份冻结前缀切成两个片段由A/B两路并发演算后合并发布。
 
 **Python WAL教学模型，不注入真实PostgreSQL故障，不执行数据库物理恢复。** PostgreSQL真实保存业务输入、冻结快照、任务和结果，Redis实际用于worker互斥，后台Python实际演算恢复历史。
+
+## 双路并发复演
+持久化前缀按LSN均衡切成两个片段（崩溃点0为空片段），A/B两条通道各自领取并独立演算：每路一把Redis锁（`wal-replay-lane-A/B`），一路卡住或被暂停时另一路照常推进，行级`skip_locked`保证同一片段不重复计算。待合并的片段结果每路只保留最新一份、整笔复演最多两份。
+
+跨片事务按断电位置的完整前缀**整笔裁决**：已提交事务的写入即使begin/write/commit分散两片也整体保留（已提交不丢），已abort与未结束事务的写入整体撤销、不留账，撤销按全局LSN倒序。片段乱序算完不影响结果——合并只按LSN归并。合并结果以独立串行演练为oracle，逐项核对恢复账本、重做后账本、撤销轨迹与SHA256，全部等价才在**同一事务**内把账本和`published`完成状态一起发布；核对不过则置failed、拒绝发布。
+
+一路失败可整笔重试：已就绪片段及其结果保留、不重新计数，只补算失败/暂停/在途片段（`attempts`/`attempts_total`记录真实演算次数）。暂停作用于单路分片（该路未领取的片段置paused、在算的跑完即就绪），复演整体保持running、另一路照常推进。页面可暂停/恢复任一路、整笔重试，并查看每路状态、积压片段数（x/2）、片段校验和与错误；旧的单路恢复演练（Recovery/worker）保持不变、照常运行。
 
 ## 启动
 ```bash
@@ -32,7 +39,7 @@ SEED_DEMO=true时启动自动执行种子；自然键查重，不覆盖用户修
 crash_after=N表示前N条日志已持久化。最近静止检查点保存全部数据页，检查点后数据页假定均未写回（no-force）。恢复重放日志写入和已abort的撤销，再按LSN倒序撤销未结束事务。独立oracle从检查点账本仅应用已提交事务写入，结果须相同。输出重做/撤销轨迹、事务集合、各阶段账本、SHA256和模型版本。空输入、未知键、事务顺序非法、检查点有活动事务、写锁冲突、崩溃点超限均拒绝。模型不涉及页LSN、CLR、模糊检查点或真实磁盘故障；不是完整ARIES实现。
 
 ## 工程与开发
-前端原生HTML/CSS/JS+Nginx1.27；后端Python3.11+FastAPI+SQLAlchemy+PyJWT；PostgreSQL16和Redis7；5服务均healthcheck。持久任务队列在PG，单worker通过Redis锁互斥。20条待执行配额，审计记录写入操作，JWT8小时、PBKDF2随机盐密码。后端路由不含/api，Nginx/api/去前缀代理。
+前端原生HTML/CSS/JS+Nginx1.27；后端Python3.11+FastAPI+SQLAlchemy+PyJWT；PostgreSQL16和Redis7；7服务均healthcheck。持久任务队列在PG，单路worker通过Redis锁`wal-worker`互斥；双路复演由replay-worker-a/b两个进程各绑一条通道（`REPLAY_LANE`），收尾合并另用`wal-replay-settle`锁避免重复发布。20条待执行配额，审计记录写入操作，JWT8小时、PBKDF2随机盐密码。后端路由不含/api，Nginx/api/去前缀代理。
 
 目录frontend/src/{api,stores,types,components/common,hooks,pages,router,utils,constants}与backend/src/{routes,controllers,services,models,schemas,middlewares,utils,constants,config}。本地开发安装backend/requirements.txt并设DATABASE_URL/REDIS_URL/JWT_SECRET，再运行uvicorn src.main:app；前端需代理/api。migrations记录初始化结构，暂无在线升级器。
 
